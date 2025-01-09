@@ -36,6 +36,8 @@ CMD ["sh", "-c", " \
   # 3) Create the role 'kushsingh' if it doesn't exist
   su-exec postgres createuser -s kushsingh || true && \
   # 4) Run migrations (DB already exists by default: 'postgres')
+  mkdir prisma/migrations && \
+  npx prisma migrate dev --name initial_setup && \
   npx prisma migrate deploy && \
   # 5) Start two Nest debug instances
   npx concurrently \"PORT=3000 npm run start:debug\" \"PORT=4000 npm run start:debug\" \

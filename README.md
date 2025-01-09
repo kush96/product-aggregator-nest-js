@@ -83,7 +83,7 @@ To set up and run the application:
 2. Ensure Docker CLI is installed on your system.
 3. Build the Docker image:
    ```bash
-   docker build -t product-aggregator .
+   docker build --no-cache -t product-aggregator .
    ```
 4. Run the application:
    ```bash

@@ -13,6 +13,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// not storing anything here yet, but can be used in future
 model Product {
   id              String   @id @default(uuid())
   upc_id          String   
@@ -26,4 +27,11 @@ model Product {
   currency        String
 
   @@unique([upc_id, custom_provider])
+}
+
+model product_pricing_time {
+  id              String   @id @default(uuid())
+  upc_id          String   
+  time            DateTime
+  price           Int
 }

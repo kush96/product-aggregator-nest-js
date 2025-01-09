@@ -4,6 +4,7 @@ import axios from 'axios'
 import { ProductRepository } from './product.repository'
 import { CustomProvider1Processor } from './product-processors/custom.provider.1.processor';
 import { CustomProvider2Processor } from './product-processors/custom.provider.2.processor';
+import {Product, product_pricing_time as ProductPricingTime} from "@prisma/client"
 
 @Injectable()
 export class ProductService{
@@ -24,66 +25,133 @@ export class ProductService{
 
     constructor(private readonly productRepo: ProductRepository){}
 
-async getProductFromAllDataSources(upc:string){
-        
-        // get product using upc from db (product.repository, write it if it doesn't exist)
-        const productsDb = await this.productRepo.getProductsByUPC(upc)
-        
-        
-        if (productsDb && productsDb.length > 0)
-        {
-            // check if any product is outdated in the db by more than 60 seconds
-            const hasOutdated = productsDb.some(product => 
-                new Date(product.last_updated)
-                < new Date(Date.now() - this.MAX_TIME_TILL_PRODUCT_REFRESH_IN_SECONDS * 1000));
-            
-            // if no return fetched or db products
-            if(!hasOutdated){
-                console.log("Data served from DB")
-                return productsDb;
-            }
-        }
+async getAllProductsWithBestPrice(){
 
-        // else
-        // fetch all products with given upc from all providers simultaeneously using allSettled
-        // collect the results, and process them and print if any error fetching
-        const results = await Promise.allSettled(
-            this.providers.map((provider) =>
-            axios.get(provider.url + upc).then((response) =>
-                provider.processor.process(response.data),
-            ),
-            ),
-        );
-
-        const productsWithLatestData = [];
-
-        // collect transformed products from providers and log errors if present
-        results.forEach((result, index) => {
-            const provider = this.providers[index];
-            if (result.status === 'fulfilled') {
-                productsWithLatestData.push(...result.value);
-            } else {
-                console.error('Errors while fetching from provider:'+ provider.name + ' with reason' + result.reason.message);
-            }
-        });
-
-        // add new products to db, update existing products with fresh data
-        const existingProductsInDb = await this.productRepo.getExistingProducts(productsWithLatestData)
+    // get all products from all providers
+    const allSuccessfullyFetchedProducts = await this.getProductsFromProviderAPIs();
     
-        const newProductsToAddInDb = productsWithLatestData.filter(
-            (product) => !existingProductsInDb.some(
-            (existingProduct) => 
-                existingProduct.upc_id === product.upc_id && 
-                existingProduct.custom_provider === product.custom_provider
-            )
-        );
+    // map of upc_id --> product
+    const minimumPricedProductsMap = await this.getMinPricedProductsFromAllProducts(allSuccessfullyFetchedProducts);
 
-        await this.productRepo.updateProductsByUPCAndProvider(existingProductsInDb);
-        
-        await this.productRepo.createManyProducts(newProductsToAddInDb);
+    // store prd pricing at current time
+    const productPricingWithTime= Object.entries(minimumPricedProductsMap).map(([upc_id, prd]) => ({
+        upc_id: upc_id,
+        price: prd.price,
+        time: new Date()
+      }));
+    // create latest pricing data for pricing history table
+    this.productRepo.addProductPricingTime(productPricingWithTime);
 
-        console.log("Latest Data served from Provider APIs")
-        // return list of products
-        return productsWithLatestData
+    return minimumPricedProductsMap;
+    
+}
+
+async getProductWithPricingHistory(upc_id:string){
+    const allSuccessfullyFetchedProductsForUpcId = await this.getProductsFromProviderAPIs(upc_id);
+    if(!allSuccessfullyFetchedProductsForUpcId || allSuccessfullyFetchedProductsForUpcId.length<1){
+        console.error("Prd with given upc_id not present")
+        return {};
     }
+    const minimumPricedProductForUpcId = (await this.getMinPricedProductsFromAllProducts(allSuccessfullyFetchedProductsForUpcId))[upc_id];
+    const prdPricingHistory = await this.productRepo.getProductPricingHistoryForUpcId(upc_id);
+    return {
+        ...minimumPricedProductForUpcId,
+        pricingHistory: prdPricingHistory
+    }
+}
+
+async getPricingChanges(timeFrame: string) {
+    // 1) Determine the date threshold
+    const dateThreshold = new Date();
+    if (timeFrame === 'LAST_TEN_SECOND') {
+      dateThreshold.setSeconds(dateThreshold.getSeconds() - 10);
+    } else if (timeFrame === 'LAST_MIN') {
+      dateThreshold.setMinutes(dateThreshold.getMinutes() - 1);
+    } else if (timeFrame === 'LAST_HOUR') {
+      dateThreshold.setHours(dateThreshold.getHours() - 1);
+    }
+  
+    // 2) Fetch recent pricing data
+    const recentPricing = await this.productRepo.getRecentPricingSince(dateThreshold);
+  
+    // 3) Group by upc_id
+    const groupedMap: Record<string, { price: number; time: Date }[]> = {};
+    for (const p of recentPricing) {
+      if (!groupedMap[p.upc_id]) {
+        groupedMap[p.upc_id] = [];
+      }
+      groupedMap[p.upc_id].push({ price: p.price, time: p.time });
+    }
+  
+    // 4) Build the results without fetching the full product
+    const results = [];
+    for (const [upc_id, pricingHistory] of Object.entries(groupedMap)) {
+      results.push({ upcId: upc_id, pricingHistory });
+    }
+  
+    // 5) Return the final structured result
+    return results;
+  }
+  
+  
+
+
+/**
+ * Given allSuccessfully fethed products from providers, this function returns a map of upc_id(unique prd id) --> prd
+ * @param allSuccessfullyFetchedProducts : all Products from all Providers. There can be repeated products, i.e, two same
+ *                                         prd from diff providers. They will have the same upc_id
+ * @returns map of upc_id(unique prd id) --> prd
+ */
+async getMinPricedProductsFromAllProducts(allSuccessfullyFetchedProducts: Product[]): Promise<Record<string, Product>>{
+        // map of upc_id --> product
+        const minimumPricedProductsMap:Record<string, Product> = {}
+
+        // make map of prd upc_id --> product at best available price
+        allSuccessfullyFetchedProducts.forEach(
+            (prd, ind) => {
+                if(minimumPricedProductsMap[prd.upc_id]){
+                    const cur_min_priced_prd = minimumPricedProductsMap[prd.upc_id];
+                    if(prd.price < cur_min_priced_prd.price)
+                        minimumPricedProductsMap[prd.upc_id] = prd;   
+                }
+                else
+                    minimumPricedProductsMap[prd.upc_id] = prd;
+            }
+        )
+        return minimumPricedProductsMap;
+}
+/**
+ * Fetches all Products from all Providers. There can be repeated products, i.e, two same rd from diff providers.
+ * Two similar prds will have same upc_id.
+ * @param upc_id (optional) : If upc_id not given , all products from all providers fetched, else if given, only prds
+ *                            with given upc_id fetched from all providers
+ * @returns a list of all fetched products
+ */
+async getProductsFromProviderAPIs(upc_id?:string): Promise<Product[]>{
+    const results = await Promise.allSettled(
+        this.providers.map((provider) =>
+            axios
+                .get(upc_id ? `${provider.url}${upc_id}` : provider.url)
+                .then((response) =>
+                    // Based on provider, data is processed to transform into Product data type 
+                    // we store in our db
+                    provider.processor.process(response.data),
+                ),
+        ),
+    );
+
+    const allSuccessfullyFetchedProducts = [];
+    
+    // collect transformed products from providers and log errors if present
+    results.forEach((result, index) => {
+        const provider = this.providers[index];
+
+        if (result.status === 'fulfilled') {
+            allSuccessfullyFetchedProducts.push(...result.value);
+        } else {
+            console.error('Errors while fetching from provider:'+ provider.name + ' with reason' + result.reason.message);
+        }
+    });
+    return allSuccessfullyFetchedProducts;
+}
 } 
